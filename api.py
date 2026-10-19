@@ -518,6 +518,7 @@ class MovieBoxEngine:
 engine = MovieBoxEngine.get_instance()
 
 @app.get("/")
+@app.head("/")
 async def root():
     return {
         "status": "online",
