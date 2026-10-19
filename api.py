@@ -13,13 +13,13 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
+import httpx
 
 try:
     from curl_cffi import requests as cr
 except ImportError:
     cr = None
-    import httpx
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -278,7 +278,6 @@ class MovieBoxEngine:
         url = f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}"
         resp_json = self.api_request("GET", url)
         
-        # Safely guard against None or non-dictionary responses
         if not resp_json or not isinstance(resp_json, dict):
             data = {}
         else:
@@ -527,9 +526,6 @@ async def root():
         "docs": "/docs"
     }
 
-"""
-    return HTMLResponse(content=html_content)
-
 @app.get("/search")
 def search(q: str = Query(..., min_length=1), page: int = 1, per_page: int = 20):
     return {"query": q, "page": page, "results": engine.search(q, page=page, per_page=per_page)}
@@ -636,15 +632,6 @@ def get_home():
     url = f"{API_BASE}/home?host=moviebox.ph"
     resp = engine.session.get(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, timeout=20)
     return resp.json()
-
-
-
-
-
-
-from fastapi import Query
-from fastapi.responses import StreamingResponse
-import httpx
 
 @app.get("/api/proxy/video")
 async def proxy_video(
