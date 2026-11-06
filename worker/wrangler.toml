@@ -1,0 +1,4 @@
+name = "streamvy-media-proxy"
+main = "src/index.js"
+compatibility_date = "2026-11-06"
+workers_dev = true
