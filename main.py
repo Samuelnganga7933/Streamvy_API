@@ -796,6 +796,48 @@ async def debug_probe(url: str):
     return out
 
 
+@app.get("/debug/selfstream")
+async def debug_selfstream(subject_id: str, detail_path: str, se: int = 0, ep: int = 0):
+    """Temporary: resolve and fetch on the same egress to test signed URLs."""
+    async with httpx.AsyncClient(timeout=90) as client:
+        resolved = await client.get(
+            f"https://movie-api.streamvy.me/api/stream/{subject_id}",
+            params={"detail_path": detail_path, "se": se, "ep": ep},
+        )
+    payload = resolved.json()
+    sources = payload.get("sources") or []
+    if not sources:
+        return {"resolve_status": resolved.status_code, "sources": 0, "note": payload.get("note")}
+    url = sources[0]["url"]
+    session = CurlAsyncSession()
+    try:
+        r = await session.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+                "Referer": "https://moviebox.ph/",
+                "Origin": "https://moviebox.ph",
+                "Range": "bytes=0-1023",
+            },
+            stream=True,
+            impersonate="chrome",
+            timeout=40,
+        )
+        body = await r.acontent()
+        result = {
+            "resolve_status": resolved.status_code,
+            "source_host": url.split("/")[2],
+            "cdn_status": r.status_code,
+            "cdn_server": r.headers.get("server"),
+            "bytes": len(body),
+            "preview": body[:16].decode("latin-1"),
+        }
+        r.close()
+        return result
+    finally:
+        await session.close()
+
+
 @app.api_route("/proxy/stream", methods=["GET", "HEAD"])
 async def proxy_stream(request: Request, url: str):
     """Playback relay: same bytes as upstream, no forced disposition."""
