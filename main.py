@@ -4,9 +4,11 @@ import re
 import json
 import httpx
 import asyncio
-from fastapi import FastAPI, HTTPException, Query
+from typing import Optional
+from urllib.parse import quote
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 app = FastAPI(
     title="MovieBox API Pro",
@@ -552,43 +554,146 @@ async def get_captions(subject_id: str, detail_path: str, se: int = 1, ep: int =
     inner = data.get("data", {})
     captions = inner.get("captions", []) if isinstance(inner, dict) else inner
     return {"subject_id": subject_id, "se": se, "ep": ep, "count": len(captions), "captions": captions}
-from fastapi import Response, Request
-import httpx
+# Headers a player may send that the CDN needs to see verbatim. `Range` is the
+# important one: without it a seek re-downloads the film from byte zero, and the
+# browser cannot resume a stalled download.
+PROXY_REQUEST_HEADERS = ("range", "if-range", "if-none-match", "if-modified-since")
 
-@app.get("/proxy/stream")
-async def proxy_stream(request: Request, url: str):
-    """Proxies media streams, bypassing CDN anti-hotlinking and missing header blocks."""
+# Upstream headers worth forwarding. `Content-Encoding` is included because the
+# body is relayed raw (`aiter_raw`), so the bytes stay in their declared
+# encoding. Hop-by-hop headers are never forwarded.
+PROXY_RESPONSE_HEADERS = (
+    "content-type",
+    "content-length",
+    "content-range",
+    "content-encoding",
+    "accept-ranges",
+    "etag",
+    "last-modified",
+    "cache-control",
+)
+
+
+def _download_filename(value: Optional[str]) -> Optional[str]:
+    """Make a caller-supplied filename safe to place in a response header.
+
+    Quotes and control characters are stripped so the value cannot terminate
+    the header early, and the ASCII fallback keeps non-Latin titles readable in
+    clients that ignore RFC 5987.
+    """
+    if not value:
+        return None
+    cleaned = re.sub(r'[\x00-\x1f\x7f"\\/]', "", value).strip()
+    if not cleaned:
+        return None
+    return cleaned[:180]
+
+
+async def _relay_media(request: Request, url: str, download_name: Optional[str] = None):
+    """Relay a media URL with the Referer its CDN requires.
+
+    The previous version buffered the whole file with `client.get()` before it
+    answered -- a 2 GB film meant a 2 GB download before the first byte reached
+    the player -- and it referenced `StreamingResponse` without importing it, so
+    every call died with a 500. This opens the upstream connection with
+    `client.send(..., stream=True)` and relays the response as it arrives, which
+    keeps Range seeking, backpressure and early playback working.
+    """
+    if not re.match(r"^https?://", url, re.I):
+        raise HTTPException(status_code=400, detail="Only http(s) URLs can be proxied")
+
     upstream_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
         "Referer": "https://moviebox.ph/",
         "Origin": "https://moviebox.ph",
     }
-    
-    # Forward client range headers if present (essential for video seeking/scrubbing)
-    client_range = request.headers.get("range")
-    if client_range:
-        upstream_headers["Range"] = client_range
+    for name in PROXY_REQUEST_HEADERS:
+        value = request.headers.get(name)
+        if value:
+            upstream_headers[name] = value
 
-    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
-    
-    async def stream_generator():
-        async with client.stream("GET", url, headers=upstream_headers) as response:
-            async for chunk in response.aiter_bytes():
+    client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(30.0, connect=15.0, read=120.0),
+    )
+    try:
+        upstream = await client.send(
+            client.build_request(
+                "HEAD" if request.method == "HEAD" else "GET",
+                url,
+                headers=upstream_headers,
+            ),
+            stream=True,
+        )
+    except Exception as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")
+
+    if upstream.status_code >= 400:
+        body = await upstream.aread()
+        await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Upstream error {upstream.status_code}: {body[:200].decode('utf-8', 'replace')}",
+        )
+
+    response_headers = {
+        name: upstream.headers[name]
+        for name in PROXY_RESPONSE_HEADERS
+        if name in upstream.headers
+    }
+    response_headers["accept-ranges"] = "bytes"
+    response_headers["access-control-expose-headers"] = (
+        "Content-Length, Content-Range, Accept-Ranges, Content-Disposition"
+    )
+    filename = _download_filename(download_name)
+    if filename:
+        quoted = quote(filename)
+        response_headers["content-disposition"] = (
+            f"attachment; filename=\"{quoted}\"; filename*=UTF-8''{quoted}"
+        )
+    media_type = upstream.headers.get("content-type", "video/mp4")
+
+    if request.method == "HEAD":
+        await upstream.aclose()
+        await client.aclose()
+        return Response(
+            status_code=upstream.status_code,
+            headers=response_headers,
+            media_type=media_type,
+        )
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_raw(64 * 1024):
                 yield chunk
-
-    # Grab initial headers from upstream to mirror content type and length
-    async with httpx.AsyncClient(follow_redirects=True) as initial_client:
-        head_resp = await initial_client.get(url, headers=upstream_headers)
+        finally:
+            await upstream.aclose()
+            await client.aclose()
 
     return StreamingResponse(
-        stream_generator(),
-        status_code=head_resp.status_code,
-        headers={
-            "Content-Type": head_resp.headers.get("content-type", "video/mp4"),
-            "Content-Length": head_resp.headers.get("content-length", ""),
-            "Accept-Ranges": "bytes",
-        }
+        body(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        media_type=media_type,
     )
+
+
+@app.api_route("/proxy/stream", methods=["GET", "HEAD"])
+async def proxy_stream(request: Request, url: str):
+    """Playback relay: same bytes as upstream, no forced disposition."""
+    return await _relay_media(request, url)
+
+
+@app.api_route("/proxy/download", methods=["GET", "HEAD"])
+async def proxy_download(request: Request, url: str, filename: Optional[str] = None):
+    """Save relay: identical streaming, with a Content-Disposition filename.
+
+    A cross-origin `<a download>` attribute is ignored by browsers, so the
+    frontend points its save links here and lets this header name the file.
+    """
+    return await _relay_media(request, url, download_name=filename)
 
 if __name__ == "__main__":
     import uvicorn
