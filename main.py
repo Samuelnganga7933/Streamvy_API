@@ -726,6 +726,20 @@ async def _relay_media(request: Request, url: str, download_name: Optional[str] 
     )
 
 
+@app.get("/health")
+async def health():
+    """Report which transport the media relay will use.
+
+    The CDN rejects a plain httpx/TLS client from a data-centre IP with 426, so
+    this makes the deployed choice visible instead of inferring it from a 502.
+    """
+    return {
+        "ok": True,
+        "proxy_transport": "curl_cffi" if CurlAsyncSession is not None else "httpx",
+        "python": os.sys.version.split()[0],
+    }
+
+
 @app.api_route("/proxy/stream", methods=["GET", "HEAD"])
 async def proxy_stream(request: Request, url: str):
     """Playback relay: same bytes as upstream, no forced disposition."""
