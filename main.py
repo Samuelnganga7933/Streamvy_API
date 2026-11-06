@@ -10,6 +10,16 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 
+# The media CDN fingerprints the TLS client, not just the headers: from a data
+# centre IP a plain `httpx` request with a browser User-Agent is answered 426,
+# while the same headers through curl_cffi's Chrome impersonation get the file.
+# `curl_cffi` is already a dependency (api.py uses it for extraction); fall back
+# to httpx so a local install without it still serves.
+try:
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession
+except Exception:  # pragma: no cover - exercised only when the wheel is absent
+    CurlAsyncSession = None
+
 app = FastAPI(
     title="MovieBox API Pro",
     description="Full Pure REST API for moviebox.ph — Zero Scraping",
@@ -596,8 +606,11 @@ async def _relay_media(request: Request, url: str, download_name: Optional[str] 
     answered -- a 2 GB film meant a 2 GB download before the first byte reached
     the player -- and it referenced `StreamingResponse` without importing it, so
     every call died with a 500. This opens the upstream connection with
-    `client.send(..., stream=True)` and relays the response as it arrives, which
-    keeps Range seeking, backpressure and early playback working.
+    `stream=True` and relays the response as it arrives, which keeps Range
+    seeking, backpressure and early playback working.
+
+    curl_cffi is preferred because the CDN rejects a mismatched TLS fingerprint
+    (426) even when the browser headers are correct. httpx remains the fallback.
     """
     if not re.match(r"^https?://", url, re.I):
         raise HTTPException(status_code=400, detail="Only http(s) URLs can be proxied")
@@ -606,43 +619,78 @@ async def _relay_media(request: Request, url: str, download_name: Optional[str] 
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
         "Referer": "https://moviebox.ph/",
         "Origin": "https://moviebox.ph",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     for name in PROXY_REQUEST_HEADERS:
         value = request.headers.get(name)
         if value:
             upstream_headers[name] = value
 
-    client = httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=httpx.Timeout(30.0, connect=15.0, read=120.0),
-    )
-    try:
-        upstream = await client.send(
-            client.build_request(
-                "HEAD" if request.method == "HEAD" else "GET",
+    method = "HEAD" if request.method == "HEAD" else "GET"
+
+    if CurlAsyncSession is not None:
+        session = CurlAsyncSession()
+        try:
+            upstream = await session.get(
                 url,
                 headers=upstream_headers,
-            ),
-            stream=True,
+                stream=True,
+                impersonate="chrome",
+                timeout=30,
+            )
+        except Exception as exc:
+            await session.close()
+            raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")
+
+        async def close_upstream():
+            upstream.close()
+            await session.close()
+
+        async def read_error() -> bytes:
+            return await upstream.acontent()
+
+        def response_headers_from_upstream() -> dict:
+            return {name: upstream.headers[name] for name in PROXY_RESPONSE_HEADERS if name in upstream.headers}
+
+        def chunks():
+            return upstream.aiter_content()
+    else:
+        client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(30.0, connect=15.0, read=120.0),
         )
-    except Exception as exc:
-        await client.aclose()
-        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")
+        try:
+            upstream = await client.send(
+                client.build_request(method, url, headers=upstream_headers),
+                stream=True,
+            )
+        except Exception as exc:
+            await client.aclose()
+            raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {exc}")
+
+        async def close_upstream():
+            await upstream.aclose()
+            await client.aclose()
+
+        async def read_error() -> bytes:
+            return await upstream.aread()
+
+        def response_headers_from_upstream() -> dict:
+            return {name: upstream.headers[name] for name in PROXY_RESPONSE_HEADERS if name in upstream.headers}
+
+        def chunks():
+            return upstream.aiter_raw(64 * 1024)
 
     if upstream.status_code >= 400:
-        body = await upstream.aread()
-        await upstream.aclose()
-        await client.aclose()
+        body = await read_error()
+        await close_upstream()
         raise HTTPException(
             status_code=502,
             detail=f"Upstream error {upstream.status_code}: {body[:200].decode('utf-8', 'replace')}",
         )
 
-    response_headers = {
-        name: upstream.headers[name]
-        for name in PROXY_RESPONSE_HEADERS
-        if name in upstream.headers
-    }
+    response_headers = response_headers_from_upstream()
     response_headers["accept-ranges"] = "bytes"
     response_headers["access-control-expose-headers"] = (
         "Content-Length, Content-Range, Accept-Ranges, Content-Disposition"
@@ -656,8 +704,7 @@ async def _relay_media(request: Request, url: str, download_name: Optional[str] 
     media_type = upstream.headers.get("content-type", "video/mp4")
 
     if request.method == "HEAD":
-        await upstream.aclose()
-        await client.aclose()
+        await close_upstream()
         return Response(
             status_code=upstream.status_code,
             headers=response_headers,
@@ -666,11 +713,10 @@ async def _relay_media(request: Request, url: str, download_name: Optional[str] 
 
     async def body():
         try:
-            async for chunk in upstream.aiter_raw(64 * 1024):
+            async for chunk in chunks():
                 yield chunk
         finally:
-            await upstream.aclose()
-            await client.aclose()
+            await close_upstream()
 
     return StreamingResponse(
         body(),
