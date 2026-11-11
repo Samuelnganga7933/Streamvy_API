@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "streamvy-api",
+  // The account that owns the `streamvy-api` Worker (required: this Cloudflare
+  // user has more than one account, and non-interactive deploys cannot prompt).
+  "account_id": "f887e4f2d8e1cb501a4a94e0ed573a09",
+  // `cf_entry.py` wraps the FastAPI app in main.py with the Workers ASGI
+  // connector, so main.py itself stays deployable to Vercel unchanged.
+  "main": "cf_entry.py",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["python_workers", "python_dedicated_snapshot"],
+  "observability": {
+    "enabled": true
+  }
+}

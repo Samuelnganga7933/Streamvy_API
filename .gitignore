@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pywrangler bundles the Worker dependencies into this folder at deploy time.
+python_modules/
+.uv-cache/
+
+# pywrangler / uv project environments
+.venv-workers/

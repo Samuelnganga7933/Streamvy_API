@@ -1,0 +1,11 @@
+{
+  "name": "streamvy-api",
+  "private": true,
+  "scripts": {
+    "deploy": "uv run pywrangler deploy",
+    "dev": "uv run pywrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.114.0"
+  }
+}
